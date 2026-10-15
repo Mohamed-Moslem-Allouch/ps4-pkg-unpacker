@@ -1,0 +1,37 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Distribution / Build
+build/
+dist/
+*.egg-info/
+
+# PS4 & Temporary files
+*.pkg
+*.pfs
+*.dat
+temp/
+output/
+inner/
+game_unpacked/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+# Local scripts
+push_to_github.bat
+*.bat.local
