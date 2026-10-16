@@ -13,12 +13,14 @@ It handles official/retail PKG structures and Fake PKGs (FPKG), decrypting outer
 ## ✨ Features
 
 * 🖱️ **Zero Setup Drag & Drop:** Drag any `.pkg` file directly onto `Drag_Drop_Unpack_PKG.bat`.
+* ⚡ **100% In-Memory Streaming (Zero Temp Disk Usage):** Streams outer PFS and nested `pfs_image.dat` directly from the package without writing 20–80 GB of intermediate files to your `C:` drive or disk!
+* 🚀 **Multi-Core CPU Parallel Decompression:** Automatically saturates all CPU cores and threads (e.g. 16 threads) for maximum decompression speeds.
+* 📊 **Real-Time Visual Progress Bar:** Live percentage, throughput speed (`MB/s`), processed vs total GB, and remaining `ETA`.
 * 🔍 **Smart Package Detection:** Automatically detects whether a file is a **Fake PKG (FPKG)** or an **Official Sony Retail PKG (PSN)**.
 * 🎮 **Full Fake PKG (FPKG) Unpacking:** Fully decrypts and extracts all outer system files and inner game files (`eboot.bin`, game data, assets, WADs, audio, textures).
 * 🛡️ **Retail Package & Passcode Support:** Extracts all 49+ package metadata files, DDS textures, TRP trophies, background artwork, sounds, and changelogs. If a 32-character game passcode is provided (`-p/--passcode` or interactive prompt), decrypts the game partition as well.
 * 🔐 **SC Entry Decryption:** Decrypts encrypted system files like `nptitle.dat` and `npbind.dat` using `DK3`.
 * 🌍 **Full Unicode & Multilingual Support:** Correctly prints non-ASCII game titles (Arabic, Japanese, Chinese, Cyrillic, etc.) without terminal encoding errors.
-* ⚡ **Fast In-Process Unpacking:** No complex compilation needed; uses pure Python with hardware-accelerated cryptographic primitives (`cryptography`).
 
 ---
 
