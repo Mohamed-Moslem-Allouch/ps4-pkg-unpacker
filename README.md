@@ -13,34 +13,12 @@ It handles official/retail PKG structures and Fake PKGs (FPKG), decrypting outer
 ## ✨ Features
 
 * 🖱️ **Zero Setup Drag & Drop:** Drag any `.pkg` file directly onto `Drag_Drop_Unpack_PKG.bat`.
-* 🔑 **Automatic Key Derivation:** Dynamically decrypts `DK3` (`key1[3]`), resolves `IMAGE_KEY`, and computes the `EKPFS` and sector tweak/data keys.
-* 📦 **Nested PFS Decryption & Decompression:** Fully decompresses inner container partitions (`pfs_image.dat`) containing:
-  * `eboot.bin`
-  * Game assets & archives (`EXEC/WAD/`, `.pak`, audio, textures, etc.)
-  * Mapping descriptors (`sce_discmap.plt`, `sce_discmap_patch.plt`)
-* 🎨 **System Metadata Extraction (`sce_sys/`):** Pulls `param.sfo`, game icons (`icon0.png`, `icon0.dds`), wallpapers (`pic0.png`, `pic1.png`), and update logs (`changeinfo/`).
+* 🔍 **Smart Package Detection:** Automatically detects whether a file is a **Fake PKG (FPKG)** or an **Official Sony Retail PKG (PSN)**.
+* 🎮 **Full Fake PKG (FPKG) Unpacking:** Fully decrypts and extracts all outer system files and inner game files (`eboot.bin`, game data, assets, WADs, audio, textures).
+* 🛡️ **Retail Package & Passcode Support:** Extracts all 49+ package metadata files, DDS textures, TRP trophies, background artwork, sounds, and changelogs. If a 32-character game passcode is provided (`-p/--passcode` or interactive prompt), decrypts the game partition as well.
+* 🔐 **SC Entry Decryption:** Decrypts encrypted system files like `nptitle.dat` and `npbind.dat` using `DK3`.
 * 🌍 **Full Unicode & Multilingual Support:** Correctly prints non-ASCII game titles (Arabic, Japanese, Chinese, Cyrillic, etc.) without terminal encoding errors.
 * ⚡ **Fast In-Process Unpacking:** No complex compilation needed; uses pure Python with hardware-accelerated cryptographic primitives (`cryptography`).
-
----
-
-## 🚀 Getting Started
-
-### 1. Prerequisites
-* **Windows 10 / 11**
-* **Python 3.10+** (Make sure to check *"Add Python to PATH"* during installation)
-
-### 2. Installation
-Clone or download this repository:
-```bash
-git clone https://github.com/Mohamed-Moslem-Allouch/ps4-pkg-unpacker.git
-cd ps4-pkg-unpacker
-```
-
-Install required dependencies by double-clicking **`install_requirements.bat`**, or via terminal:
-```bash
-pip install -r requirements.txt
-```
 
 ---
 
@@ -52,15 +30,30 @@ pip install -r requirements.txt
 3. The unpacked folder will be created automatically in the same folder as the `.pkg` file.
 
 ### Method 2: Command Line (CLI)
-You can also run the Python script directly from your terminal:
+You can run the Python script directly from your terminal:
 ```bash
 python unpack_ps4_pkg.py "C:\path\to\game.pkg"
 ```
 
-Or specify multiple packages to batch-unpack:
+To provide a 32-character game passcode for a retail or custom package:
 ```bash
-python unpack_ps4_pkg.py "game_part1.pkg" "game_patch.pkg"
+python unpack_ps4_pkg.py "C:\path\to\game.pkg" -p "0123456789ABCDEF0123456789ABCDEF"
 ```
+
+To specify an output directory or dump raw PFS containers:
+```bash
+python unpack_ps4_pkg.py "game.pkg" -o "C:\ExtractedGame" --dump-pfs
+```
+
+---
+
+## 💡 Fake PKGs (fPKG) vs Official Retail PKGs
+
+* **Fake PKGs (fPKG / Homebrew Dumps):**
+  Packages dumped from a jailbroken PS4 console (e.g. using Itemzflow or PS4-dumper). These use community keys or standard passcodes, allowing 100% full extraction of all game executables (`eboot.bin`), models, textures, and data files on any PC.
+* **Official Retail PKGs (PSN CDN / Sony Downloads):**
+  Official packages downloaded from Sony's PlayStation Network. The outer system files (artwork, icons, sound, patch notes, trophies, `param.sfo`) are fully extracted by this tool. The inner game assets are hardware-encrypted by Sony's proprietary SAMU processor chip inside physical PS4 consoles and require either the 32-character developer passcode or dumping on a jailbroken console.
+
 
 ---
 

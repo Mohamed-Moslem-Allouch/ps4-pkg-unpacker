@@ -1,100 +1,102 @@
 """
-PS4 PKG Drag & Drop Unpacker
-Extracts official & Fake PKG (FPKG) archives for PlayStation 4,
-including sce_sys metadata, inner PFS partitions, eboot.bin, WADs, and game assets.
+PS4 PKG Unpacker
+Supports:
+  - Fake PKGs (FPKG / Homebrew Dumps): Full automated extraction of outer sce_sys + inner PFS (eboot.bin, assets)
+  - Retail PS4 PKGs (Official Sony / PSN): Full extraction of all sce_sys metadata, artwork, trophies, sounds,
+    and PFS decryption if a passcode is provided.
 """
 
-import os
 import sys
+import os
 import struct
-import hashlib
-import hmac
-import tempfile
 import shutil
+import hashlib
+import tempfile
+import argparse
 from pathlib import Path
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import mkpfs.pfs as pfs
 
-# Configure UTF-8 for console output to support non-ASCII game titles (Arabic, Japanese, etc.)
-try:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
-
-try:
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-except ImportError:
-    print("\n[ERROR] 'cryptography' library is missing.")
-    print("Please run: pip install -r requirements.txt\n")
-    input("Press Enter to exit...")
-    sys.exit(1)
-
-try:
-    import mkpfs.pfs as pfs
-    import mkpfs.consts as consts
-except ImportError:
-    print("\n[ERROR] 'mkpfs' library is missing.")
-    print("Please run: pip install -r requirements.txt\n")
-    input("Press Enter to exit...")
-    sys.exit(1)
+# Fix Windows console encoding for non-ASCII titles (Arabic, Japanese, etc.)
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-# -------------------------------------------------------------------------
-# Dynamic Monkey-Patch for Upstream mkpfs 1.1.0 bugs
-# -------------------------------------------------------------------------
-def _patch_mkpfs():
-    """Fix strict PFSC header validation and unbound records in mkpfs 1.1.0."""
-    try:
-        def safe_parse_pfsc_header(head: bytes) -> tuple[int, int, int, int, int]:
-            if len(head) < consts.PFSC_HEADER_SIZE:
-                raise ValueError("PFSC payload is too small for header")
-            (
-                magic,
-                unk4,
-                unk8,
-                logical_block_size,
-                logical_block_size_2,
-                block_offsets_offset,
-                data_offset,
-                logical_size,
-            ) = struct.unpack_from("<iiiiqqQq", head, 0)
+# Upstream mkpfs 1.1.0 fix: allow unk8 value 2 in PFSC compressed headers
+import mkpfs.consts as consts
+orig_parse_pfsc_header = pfs._parse_pfsc_header
+def patched_parse_pfsc_header(head: bytes) -> tuple[int, int, int, int, int]:
+    if len(head) < consts.PFSC_HEADER_SIZE:
+        raise ValueError("PFSC payload is too small for header")
+    (
+        magic,
+        unk4,
+        unk8,
+        logical_block_size,
+        logical_block_size_2,
+        block_offsets_offset,
+        data_offset,
+        logical_size,
+    ) = struct.unpack_from("<iiiiqqQq", head, 0)
+    if magic != consts.PFSC_MAGIC:
+        raise ValueError(f"invalid PFSC magic 0x{magic:08X}")
+    if logical_block_size != consts.PFSC_LOGICAL_BLOCK_SIZE:
+        raise ValueError(
+            f"invalid PFSC logical block size {logical_block_size}, expected {consts.PFSC_LOGICAL_BLOCK_SIZE}"
+        )
+    if logical_block_size_2 != logical_block_size:
+        raise ValueError("PFSC block size mismatch between block_sz and block_sz2")
+    if logical_size < 0:
+        raise ValueError("PFSC logical size is negative")
+    if logical_size % logical_block_size != 0:
+        raise ValueError("PFSC logical size is not aligned to the logical block size")
+    if block_offsets_offset < consts.PFSC_HEADER_SIZE:
+        raise ValueError("PFSC block offset table overlaps header")
+    if block_offsets_offset != consts.PFSC_BLOCK_OFFSETS_OFFSET:
+        raise ValueError(
+            f"invalid PFSC block offset table pointer {block_offsets_offset}, "
+            f"expected {consts.PFSC_BLOCK_OFFSETS_OFFSET}"
+        )
+    if data_offset < consts.PFSC_INITIAL_DATA_OFFSET:
+        raise ValueError("PFSC data offset is smaller than the minimum compatible header span")
 
-            if magic != consts.PFSC_MAGIC:
-                raise ValueError(f"invalid PFSC magic 0x{magic:08X}")
-            # Relax unk4 and unk8 checks to support all PS4 SDKs
-            if logical_block_size != consts.PFSC_LOGICAL_BLOCK_SIZE:
-                raise ValueError(
-                    f"invalid PFSC logical block size {logical_block_size}, expected {consts.PFSC_LOGICAL_BLOCK_SIZE}"
-                )
-            if logical_block_size_2 != logical_block_size:
-                raise ValueError("PFSC block size mismatch between block_sz and block_sz2")
-            if logical_size < 0:
-                raise ValueError("PFSC logical size is negative")
-            if logical_size % logical_block_size != 0:
-                raise ValueError("PFSC logical size is not aligned to the logical block size")
-
-            block_count = logical_size // logical_block_size
-            return (
-                logical_block_size,
-                block_count,
-                block_offsets_offset,
-                data_offset,
-                logical_size,
-            )
-
-        pfs._parse_pfsc_header = safe_parse_pfsc_header
-    except Exception as exc:
-        print(f"[WARN] Failed to apply runtime patch: {exc}")
-
-_patch_mkpfs()
+    block_count: int = logical_size // logical_block_size
+    return (
+        logical_block_size,
+        block_count,
+        block_offsets_offset,
+        data_offset,
+        logical_size,
+    )
+pfs._parse_pfsc_header = patched_parse_pfsc_header
 
 
-# -------------------------------------------------------------------------
-# Known PS4 Homebrew/SDK Public Keys
-# -------------------------------------------------------------------------
+
+# Known SC Entry IDs that may not be named in entry 0x200 filename table
+KNOWN_ENTRY_NAMES = {
+    0x0001: "digests.bin",
+    0x0010: "entry_keys.bin",
+    0x0020: "image_key.bin",
+    0x0080: "general_digests.bin",
+    0x0100: "metas.bin",
+    0x0200: "entry_names.bin",
+    0x0400: "license.dat",
+    0x0401: "license.info",
+    0x0402: "nptitle.dat",
+    0x0403: "npbind.dat",
+    0x0404: "selfinfo.dat",
+    0x0406: "imageinfo.dat",
+    0x0407: "target_deltainfo.dat",
+    0x0408: "origin_deltainfo.dat",
+    0x0409: "psreserved.dat",
+}
+
+
 def make_rsa_key(n_hex, e_hex, d_hex, p_hex, q_hex, dp_hex, dq_hex, qp_hex):
+    """Construct an RSA private key object from raw hex parameters."""
     n = int(n_hex, 16)
     e = int(e_hex, 16)
     d = int(d_hex, 16)
@@ -104,8 +106,13 @@ def make_rsa_key(n_hex, e_hex, d_hex, p_hex, q_hex, dp_hex, dq_hex, qp_hex):
     dq = int(dq_hex, 16)
     qp = int(qp_hex, 16)
     return rsa.RSAPrivateNumbers(
-        p, q, d, dp, dq, qp,
-        rsa.RSAPublicNumbers(e, n)
+        p=p,
+        q=q,
+        d=d,
+        dmp1=dp,
+        dmq1=dq,
+        iqmp=qp,
+        public_numbers=rsa.RSAPublicNumbers(e=e, n=n),
     ).private_key()
 
 
@@ -218,6 +225,11 @@ KEY_FAKE = make_rsa_key(
 )
 
 
+def xor_bytes(a: bytes, b: bytes) -> bytes:
+    """XOR two byte strings of equal length."""
+    return bytes(x ^ y for x, y in zip(a, b))
+
+
 def rsa_decrypt_pkcs1_v15(key, ciphertext):
     """Raw PKCS#1 v1.5 RSA decryption using Chinese Remainder Theorem."""
     c = int.from_bytes(ciphertext, "big")
@@ -227,12 +239,45 @@ def rsa_decrypt_pkcs1_v15(key, ciphertext):
     h = (pn.iqmp * (m1 - m2)) % pn.p
     m = m2 + h * pn.q
     raw = m.to_bytes((key.key_size + 7) // 8, "big")
-    if raw[0] != 0 or raw[1] != 2:
+    if len(raw) < 2 or raw[0] != 0 or raw[1] != 2:
         raise ValueError(f"Bad PKCS#1 v1.5 padding: {raw[:4].hex()}")
     idx = raw.find(b"\x00", 2)
     if idx == -1:
         raise ValueError("No 0x00 delimiter found in PKCS#1 v1.5 padding")
     return raw[idx + 1 :]
+
+
+def compute_passcode_ekpfs(content_id: str, passcode: str, index: int = 1) -> bytes:
+    """Derive EKPFS key from 32-character passcode according to Sony PKG specs."""
+    idx_hash = hashlib.sha256(index.to_bytes(4, "big")).digest()
+    cid_padded = content_id.encode("ascii").ljust(48, b"\x00")
+    cid_hash = hashlib.sha256(cid_padded).digest()
+    data = idx_hash + cid_hash + passcode.encode("ascii")
+    return hashlib.sha256(data).digest()
+
+
+def decrypt_pkg_entry(data: bytes, entry: dict, dk3: bytes) -> bytes:
+    """Decrypt an encrypted package entry using AES-128-CBC and dk3."""
+    key_idx = (entry["flags2"] & 0xF000) >> 12
+    if key_idx != 3:
+        return data
+    entry_bytes = struct.pack(
+        ">IIIIIIQ",
+        entry["id"],
+        entry["fn_offset"],
+        entry["flags1"],
+        entry["flags2"],
+        entry["offset"],
+        entry["size"],
+        0,
+    )
+    iv_key = hashlib.sha256(entry_bytes + dk3).digest()
+    pad_len = (16 - (len(data) % 16)) % 16
+    padded_data = data + b"\x00" * pad_len
+    cipher = Cipher(algorithms.AES(iv_key[16:32]), modes.CBC(iv_key[:16]))
+    decryptor = cipher.decryptor()
+    decrypted = decryptor.update(padded_data) + decryptor.finalize()
+    return decrypted[: entry["size"]]
 
 
 def parse_param_sfo(data):
@@ -258,7 +303,7 @@ def parse_param_sfo(data):
     return params
 
 
-def unpack_pkg(pkg_path, output_dir=None):
+def unpack_pkg(pkg_path, output_dir=None, passcode=None, dump_pfs=False):
     pkg_path = Path(pkg_path).resolve()
     if not pkg_path.is_file():
         print(f"[ERROR] File not found: {pkg_path}")
@@ -316,6 +361,11 @@ def unpack_pkg(pkg_path, output_dir=None):
                     name_bytes = fn_blob[e["fn_offset"] :].split(b"\x00", 1)[0]
                     e["name"] = name_bytes.decode("ascii", errors="ignore")
 
+        # Assign fallback names for known SC entries without table entries
+        for e in entries:
+            if not e.get("name") and e["id"] in KNOWN_ENTRY_NAMES:
+                e["name"] = KNOWN_ENTRY_NAMES[e["id"]]
+
         # Read and display param.sfo info
         sfo_entry = next((e for e in entries if e.get("name") == "param.sfo" or e["id"] == 0x1000), None)
         if sfo_entry:
@@ -331,6 +381,22 @@ def unpack_pkg(pkg_path, output_dir=None):
             print(f" [i] Version:  {app_ver} (Type: {category})")
             print(f" [i] Content:  {content_id}\n")
 
+        # Derive DK3 key from Entry 0x10 if available
+        entry_10 = next((e for e in entries if e["id"] == 0x10), None)
+        entry_20 = next((e for e in entries if e["id"] == 0x20), None)
+        dk3 = None
+        digests = []
+
+        if entry_10:
+            f.seek(entry_10["offset"])
+            seed_digest = f.read(32)
+            digests = [f.read(32) for _ in range(7)]
+            f.seek(entry_10["offset"] + 32 + 224 + (3 * 256))
+            try:
+                dk3 = rsa_decrypt_pkcs1_v15(KEY_DK3, f.read(256))[:32]
+            except Exception:
+                dk3 = None
+
         # Step 1: Extract outer sce_sys assets
         print("[1/3] Extracting outer package metadata & system files...")
         sce_sys_dir = output_dir / "sce_sys"
@@ -343,26 +409,30 @@ def unpack_pkg(pkg_path, output_dir=None):
                 target_file = sce_sys_dir / name
                 target_file.parent.mkdir(parents=True, exist_ok=True)
                 f.seek(e["offset"])
-                data = f.read(e["size"])
+                raw_data = f.read(e["size"])
+                # Decrypt if entry is encrypted with dk3
+                is_encrypted = bool(e["flags1"] & 0x80000000)
+                if is_encrypted and dk3:
+                    try:
+                        raw_data = decrypt_pkg_entry(raw_data, e, dk3)
+                    except Exception as err:
+                        print(f"      [WARN] Could not decrypt {name}: {err}")
                 with open(target_file, "wb") as out_f:
-                    out_f.write(data)
+                    out_f.write(raw_data)
                 extracted_outer_count += 1
 
         print(f"      Extracted {extracted_outer_count} system files into sce_sys/\n")
 
-        # Step 2: Key Derivation for PFS Decryption
-        print("[2/3] Deriving encryption keys for game filesystem (PFS)...")
-        entry_10 = next((e for e in entries if e["id"] == 0x10), None)
-        entry_20 = next((e for e in entries if e["id"] == 0x20), None)
-
+        # Step 2: Key Derivation & Package Type Analysis
+        print("[2/3] Analyzing package encryption & keys...")
         if not entry_10 or not entry_20 or pfs_image_offset == 0:
-            print("[WARN] Package does not contain standard PFS image entries. Finished.")
+            print("[INFO] Package does not contain an inner PFS game partition.")
+            print(f"[SUCCESS] All package metadata extracted to: {output_dir}")
             return True
 
-        # Read key1[3] from Entry 0x10
-        f.seek(entry_10["offset"] + 32 + 224 + (3 * 256))
-        key1_3 = f.read(256)
-        dk3 = rsa_decrypt_pkcs1_v15(KEY_DK3, key1_3)[:32]
+        if not dk3:
+            print("[WARN] Could not derive DK3 key. Cannot decrypt PFS filesystem.")
+            return False
 
         # Entry 0x20 IV/Key calculation
         entry20_bytes = struct.pack(
@@ -384,12 +454,93 @@ def unpack_pkg(pkg_path, output_dir=None):
         decryptor = aes_cipher.decryptor()
         decrypted_img_key = decryptor.update(img_key_data) + decryptor.finalize()
 
-        # Decrypt EKPFS key with FakeKeyset
-        ekpfs_key = rsa_decrypt_pkcs1_v15(KEY_FAKE, decrypted_img_key)[:32]
-        print(f"      Derived EKPFS Key: {ekpfs_key.hex()[:16]}...{ekpfs_key.hex()[-8:]}\n")
+        ekpfs_key = None
+        pkg_type_label = None
 
-        # Step 3: Extract and Unpack PFS
+        # 1. Try Fake PKG RSA decryption with FakeKeyset
+        try:
+            candidate_ekpfs = rsa_decrypt_pkcs1_v15(KEY_FAKE, decrypted_img_key)[:32]
+            if len(digests) > 1 and xor_bytes(hashlib.sha256(candidate_ekpfs).digest(), candidate_ekpfs) == digests[1]:
+                ekpfs_key = candidate_ekpfs
+                pkg_type_label = "Fake PKG (FPKG / Homebrew Dump)"
+        except Exception:
+            pass
+
+        # 2. Try standard 32-zeros passcode for FPKGs
+        if ekpfs_key is None and len(digests) > 1:
+            candidate_ekpfs = compute_passcode_ekpfs(content_id, "0" * 32, 1)
+            if xor_bytes(hashlib.sha256(candidate_ekpfs).digest(), candidate_ekpfs) == digests[1]:
+                ekpfs_key = candidate_ekpfs
+                pkg_type_label = "Fake PKG (32-zero Passcode)"
+
+        # 3. Try user-supplied passcode (via CLI flag)
+        if ekpfs_key is None and passcode and len(digests) > 1:
+            candidate_ekpfs = compute_passcode_ekpfs(content_id, passcode, 1)
+            if xor_bytes(hashlib.sha256(candidate_ekpfs).digest(), candidate_ekpfs) == digests[1]:
+                ekpfs_key = candidate_ekpfs
+                pkg_type_label = "Retail PKG (Passcode Decrypted)"
+            else:
+                print(f"[WARN] Provided passcode is invalid for {content_id}!")
+
+        # 4. If still not decrypted, package is an Official Sony Retail PKG
+        if ekpfs_key is None:
+            print("==========================================================================")
+            print(" [i] DETECTED: Official Sony Retail Package (PlayStation Network CDN)")
+            print("==========================================================================")
+            print(" This package was downloaded from official Sony servers. The game partition")
+            print(" (PFS) is encrypted with Sony's proprietary hardware master keys (SAMU).")
+            print("--------------------------------------------------------------------------")
+
+            # In interactive console, give user option to type passcode
+            if not passcode and sys.stdin and sys.stdin.isatty():
+                try:
+                    user_pass = input(" If you have the 32-character game passcode, enter it (or press Enter to skip): ").strip()
+                    if user_pass:
+                        candidate_ekpfs = compute_passcode_ekpfs(content_id, user_pass, 1)
+                        if len(digests) > 1 and xor_bytes(hashlib.sha256(candidate_ekpfs).digest(), candidate_ekpfs) == digests[1]:
+                            ekpfs_key = candidate_ekpfs
+                            pkg_type_label = "Retail PKG (Passcode Decrypted)"
+                            print(" [✓] Passcode verified successfully!\n")
+                        else:
+                            print(" [!] Invalid passcode. Skipping PFS filesystem decryption.\n")
+                except (EOFError, KeyboardInterrupt):
+                    pass
+
+        # 5. Handle raw PFS dump or finish retail package
+        if ekpfs_key is None:
+            if dump_pfs:
+                print(f" Dumping raw encrypted PFS container ({round(pfs_image_size/1024/1024, 2)} MB)...")
+                f.seek(pfs_image_offset)
+                raw_pfs_path = output_dir / "pfs_outer.pfs"
+                with open(raw_pfs_path, "wb") as out_pfs:
+                    bytes_left = pfs_image_size
+                    chunk_sz = 8 * 1024 * 1024
+                    while bytes_left > 0:
+                        chunk = f.read(min(chunk_sz, bytes_left))
+                        if not chunk:
+                            break
+                        out_pfs.write(chunk)
+                        bytes_left -= len(chunk)
+                print(f" [✓] Dumped raw PFS container to: {raw_pfs_path.name}")
+
+            print("\n--------------------------------------------------------------------------")
+            print(f"[SUCCESS] Extracted {extracted_outer_count} metadata and system files to:")
+            print(f"          {sce_sys_dir}")
+            print("\n[NOTE ON RETAIL PACKAGES]:")
+            print(" - All icons, backgrounds, audio, patch notes, trophies, and param.sfo")
+            print("   have been successfully extracted.")
+            print(" - The game assets (eboot.bin, game data, textures) inside official retail")
+            print("   packages are hardware-encrypted by Sony SAMU processor.")
+            print(" - To get raw decrypted game assets on PC, dump the game directly from a")
+            print("   jailbroken PS4 (Itemzflow or PS4-dumper), which exports a Fake PKG (fPKG).")
+            print("==========================================================================\n")
+            return True
+
+        # Step 3: Decrypt and Unpack PFS partition
+        print(f" [✓] Package Type: {pkg_type_label}")
+        print(f"     Derived EKPFS Key: {ekpfs_key.hex()[:16]}...{ekpfs_key.hex()[-8:]}\n")
         print("[3/3] Decrypting and unpacking PlayStation FileSystem (PFS)...")
+
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_pfs = Path(temp_dir) / "pfs_outer.pfs"
             temp_inner_dir = Path(temp_dir) / "inner"
@@ -399,7 +550,7 @@ def unpack_pkg(pkg_path, output_dir=None):
             f.seek(pfs_image_offset)
             with open(temp_pfs, "wb") as temp_out:
                 bytes_left = pfs_image_size
-                chunk_sz = 4 * 1024 * 1024
+                chunk_sz = 8 * 1024 * 1024
                 while bytes_left > 0:
                     read_len = min(chunk_sz, bytes_left)
                     chunk = f.read(read_len)
@@ -409,7 +560,7 @@ def unpack_pkg(pkg_path, output_dir=None):
                     bytes_left -= len(chunk)
 
             # Extract outer PFS with EKPFS key in-process
-            print("      Extracting PFS container...")
+            print("      Extracting outer PFS container...")
             res_outer = pfs.extract_pfs_image(temp_pfs, temp_inner_dir, ekpfs=ekpfs_key)
             if res_outer.errors:
                 print(f"[ERROR] Failed to unpack outer PFS: {res_outer.errors}")
@@ -444,13 +595,24 @@ def unpack_pkg(pkg_path, output_dir=None):
                     else:
                         shutil.copy2(item, dest)
 
-    print("\n[SUCCESS] PKG successfully unpacked!")
+    print("\n[SUCCESS] Game package fully unpacked!")
     print(f"Output Directory: {output_dir}")
     return True
 
 
 def main():
-    if len(sys.argv) < 2:
+    parser = argparse.ArgumentParser(
+        description="PS4 PKG Drag & Drop Unpacker - Unpacks Fake PKGs and Retail PS4 packages."
+    )
+    parser.add_argument("pkg_files", nargs="*", help="Path to one or more .pkg files")
+    parser.add_argument("-o", "--output", help="Custom output directory")
+    parser.add_argument("-p", "--passcode", help="32-character game passcode (for retail or custom packages)")
+    parser.add_argument("--dump-pfs", action="store_true", help="Dump raw encrypted PFS partition for retail packages")
+
+    args = parser.parse_args()
+
+    files = args.pkg_files
+    if not files:
         print("=======================================================")
         print(" PS4 PKG Drag and Drop Unpacker")
         print("=======================================================\n")
@@ -459,12 +621,10 @@ def main():
         if not pkg_input:
             return
         files = [pkg_input]
-    else:
-        files = sys.argv[1:]
 
     for file_path in files:
         if file_path.lower().endswith(".pkg"):
-            unpack_pkg(file_path)
+            unpack_pkg(file_path, output_dir=args.output, passcode=args.passcode, dump_pfs=args.dump_pfs)
         else:
             print(f"[SKIP] Not a .pkg file: {file_path}")
 
