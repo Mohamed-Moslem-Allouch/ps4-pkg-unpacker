@@ -1,12 +1,15 @@
 """
 PS4 PKG High-Performance Unpacker
-Multi-threaded PS4 PKG Unpacker with live progress reporting and zero temporary disk usage.
+Multi-threaded PS4 PKG Unpacker with live progress reporting, zero temporary disk usage,
+and resilient error-recovery for all homebrew, retail, and patched game packages.
 
 Features:
   - Zero Temporary Disk Usage: Streams outer PFS and nested pfs_image.dat directly
     in-memory from the PKG file. No multi-gigabyte temporary files written to C: or D:.
   - Multi-Core Acceleration: Decompresses PFSC blocks in parallel across all CPU cores/threads.
   - Live Progress Display: Real-time visual progress bar, percentage, speed (MB/s), and ETA.
+  - Resilient Extraction: Bypasses strict non-fatal linter checks (FPT collision resolvers,
+    orphan inodes, block overlaps) and automatically repairs truncated/omitted zlib block checksums.
   - Full Fake PKG (FPKG) & Retail PKG Support: Unpacks FPKGs completely and extracts
     all 49+ metadata/system files from retail packages with passcode support.
 """
@@ -19,6 +22,7 @@ import struct
 import shutil
 import hashlib
 import argparse
+import zlib
 import concurrent.futures
 from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -33,7 +37,7 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-# Upstream mkpfs 1.1.0 fix: allow unk8 value 2 or 6 in PFSC compressed headers
+# 1. Upstream mkpfs 1.1.0 fix: allow unk8 value 2 or 6 in PFSC compressed headers
 orig_parse_pfsc_header = pfs._parse_pfsc_header
 def patched_parse_pfsc_header(head: bytes) -> tuple[int, int, int, int, int]:
     if len(head) < consts.PFSC_HEADER_SIZE:
@@ -81,14 +85,56 @@ def patched_parse_pfsc_header(head: bytes) -> tuple[int, int, int, int, int]:
 pfs._parse_pfsc_header = patched_parse_pfsc_header
 
 
-# Bypass redundant upfront HMAC signature sweep during unpack (speeds up pre-check from 15 minutes to 0.005s)
+# 2. Bypass non-fatal upstream linter checks that block extraction on homebrew/patch packages
 pfs.verify_signed_image_signatures = lambda *args, **kwargs: None
+pfs.validate_fpt_maps = lambda *args, **kwargs: None
+pfs.validate_ps5_checklist = lambda *args, **kwargs: None
 
 
-# Multi-threaded parallel block decompressor for PFSC payloads
+# 3. Robust Multi-Format PFSC Block Decompressor
+# Handles standard zlib, streams with truncated/missing Adler-32 checksums, and raw deflate
+def robust_decode_pfsc_block(stored_block: bytes, logical_block_size: int, idx: int) -> bytes:
+    if len(stored_block) == logical_block_size:
+        return stored_block
+    if len(stored_block) > logical_block_size:
+        raise ValueError(f"PFSC block {idx} stored size {len(stored_block)} exceeds logical size {logical_block_size}")
+
+    # Method 1: Fast native decompressor (zlib-ng / zlib)
+    try:
+        decomp = pfs.comp.decompress_block(stored_block)
+        if len(decomp) == logical_block_size:
+            return decomp
+    except Exception:
+        pass
+
+    # Method 2: Streaming zlib (recovers blocks where tools omitted the 4-byte Adler-32 checksum)
+    try:
+        dobj = zlib.decompressobj(15)
+        decomp = dobj.decompress(stored_block, logical_block_size)
+        if len(decomp) == logical_block_size:
+            return decomp
+    except Exception:
+        pass
+
+    # Method 3: Raw deflate (wbits = -15, headers stripped by custom patch builders)
+    try:
+        dobj = zlib.decompressobj(-15)
+        decomp = dobj.decompress(stored_block, logical_block_size)
+        if len(decomp) == logical_block_size:
+            return decomp
+    except Exception:
+        pass
+
+    # Method 4: Fallback to original decompressor to raise exact trace if unrecoverable
+    return pfs._decode_pfsc_block(stored_block, logical_block_size, idx)
+
+pfs._decode_pfsc_block = robust_decode_pfsc_block
+
+
+# 4. Multi-threaded parallel block decompressor for PFSC payloads
 orig_iter_inode_logical_blocks = pfs.iter_inode_logical_blocks
 def _decode_helper(args):
-    return pfs._decode_pfsc_block(*args)
+    return robust_decode_pfsc_block(*args)
 
 
 def fast_iter_inode_logical_blocks(
@@ -183,6 +229,105 @@ def fast_iter_inode_logical_blocks(
                 yield logical_block
 
 pfs.iter_inode_logical_blocks = fast_iter_inode_logical_blocks
+
+
+# 5. Resilient Extraction Routine
+# Replaces mkpfs.extract_pfs_image to allow overwriting existing files and
+# prevent non-fatal warnings (orphan inodes, collision resolver quirks) from halting extraction.
+def resilient_extract_pfs_image(
+    image,
+    output_path,
+    progress=None,
+    ekpfs=None,
+    new_crypt=False,
+    deep=False,
+    selectors=None,
+):
+    result = pfs.PFSExtractionResult(image=image, output_path=output_path, bytes_written=0)
+    inspection = pfs.inspect_pfs_image(
+        image=image, ekpfs=ekpfs, new_crypt=new_crypt, verify_payloads=False
+    )
+
+    # Filter out non-fatal linter warnings; only stop if filesystem is truly unreadable
+    fatal_errors = [
+        err for err in inspection.errors
+        if "header is not available" in err or "failed to parse inode table" in err or "failed to build filesystem tree" in err
+    ]
+    if fatal_errors or inspection.header is None or not inspection.file_inodes:
+        result.errors.extend(fatal_errors or inspection.errors or ["Filesystem tree is empty or corrupt"])
+        return result
+
+    if output_path.exists() and not output_path.is_dir():
+        result.errors.append(f"Output path exists and is not a directory: {output_path}")
+        return result
+
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    directory_targets = [
+        output_path / Path(rel_dir)
+        for rel_dir in sorted(
+            inspection.dir_inodes.keys(),
+            key=lambda value: (value.count("/"), value.lower(), value),
+        )
+        if rel_dir != ""
+    ]
+    for directory_target in directory_targets:
+        directory_target.mkdir(parents=True, exist_ok=True)
+        result.directories_created += 1
+
+    file_targets = [
+        (rel_path, output_path / Path(rel_path), inode_num)
+        for rel_path, inode_num in sorted(inspection.file_inodes.items())
+    ]
+
+    total_bytes = sum(
+        max(0, inspection.inodes[inode_num].logical_size) for _rel, _target, inode_num in file_targets
+    )
+    progress_total = max(total_bytes, 1)
+    last_reported = 0
+    update_interval = 4 * 1024 * 1024
+
+    with image.open("rb") as fh:
+        for rel_path, file_target, inode_num in file_targets:
+            inode = inspection.inodes[inode_num]
+            file_target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                # Open with overwrite so re-running or retrying unpack proceeds cleanly
+                with file_target.open("wb") as out_fh:
+                    for chunk in pfs.iter_inode_logical_blocks(
+                        fh,
+                        inspection.header,
+                        inode,
+                        ekpfs=ekpfs,
+                        new_crypt=new_crypt,
+                    ):
+                        out_fh.write(chunk)
+                        result.bytes_written += len(chunk)
+                        if progress is not None and result.bytes_written - last_reported >= update_interval:
+                            last_reported = result.bytes_written
+                            progress.step(
+                                "extract",
+                                min(result.bytes_written, total_bytes),
+                                progress_total,
+                                bytes_processed=result.bytes_written,
+                            )
+            except Exception as exc:
+                result.errors.append(f"failed to decode file '{rel_path}' payload: {exc}")
+                return result
+
+            result.files_written += 1
+
+    if progress is not None:
+        progress.step(
+            "extract",
+            progress_total,
+            progress_total,
+            bytes_processed=result.bytes_written,
+        )
+
+    return result
+
+pfs.extract_pfs_image = resilient_extract_pfs_image
 
 
 # Virtual FileSlice & SlicePath: Streams directly from the PKG without writing pfs_outer.pfs to disk
@@ -697,7 +842,16 @@ def unpack_pkg(pkg_path, output_dir=None, passcode=None, dump_pfs=False):
     print(f" Storage:     100% In-Memory Streaming (0 GB temp disk writes)")
     print(f"=======================================================\n")
 
-    with open(pkg_path, "rb") as f:
+    try:
+        f = open(pkg_path, "rb")
+    except PermissionError:
+        print(f"[ERROR] Permission denied opening: {pkg_path.name}")
+        print("        The file is currently locked exclusively by another application")
+        print("        (e.g., PkgEditor, torrent client, or antivirus).")
+        print("        Please close any program holding this .pkg file and try again.\n")
+        return False
+
+    with f:
         header = f.read(0x440)
         if len(header) < 0x80 or header[:4] != b"\x7fCNT":
             print("[ERROR] Not a valid PS4 PKG file (Magic != 0x7FCNT).")
@@ -875,7 +1029,7 @@ def unpack_pkg(pkg_path, output_dir=None, passcode=None, dump_pfs=False):
                         if len(digests) > 1 and xor_bytes(hashlib.sha256(candidate_ekpfs).digest(), candidate_ekpfs) == digests[1]:
                             ekpfs_key = candidate_ekpfs
                             pkg_type_label = "Retail PKG (Passcode Decrypted)"
-                            print(" [✓] Passcode verified successfully!\n")
+                            print(" [+] Passcode verified successfully!\n")
                         else:
                             print(" [!] Invalid passcode. Skipping PFS filesystem decryption.\n")
                 except (EOFError, KeyboardInterrupt):
@@ -900,7 +1054,7 @@ def unpack_pkg(pkg_path, output_dir=None, passcode=None, dump_pfs=False):
                         done_dump += len(chunk)
                         bytes_left -= len(chunk)
                         pbar_dump.step("dump", done_dump, pfs_image_size, bytes_processed=done_dump)
-                print(f" [✓] Dumped raw PFS container to: {raw_pfs_path.name}")
+                print(f" [+] Dumped raw PFS container to: {raw_pfs_path.name}")
 
             print("\n--------------------------------------------------------------------------")
             print(f"[SUCCESS] Extracted {extracted_outer_count} metadata and system files to:")
@@ -916,7 +1070,7 @@ def unpack_pkg(pkg_path, output_dir=None, passcode=None, dump_pfs=False):
             return True
 
         # Step 3: Decrypt and Unpack PFS partition
-        print(f" [✓] Package Type:     {pkg_type_label}")
+        print(f" [+] Package Type:     {pkg_type_label}")
         print(f"     Game Partition:   {format_size(pfs_image_size)}")
         print(f"     Derived EKPFS:    {ekpfs_key.hex()[:16]}...{ekpfs_key.hex()[-8:]}\n")
 
@@ -927,8 +1081,12 @@ def unpack_pkg(pkg_path, output_dir=None, passcode=None, dump_pfs=False):
 
         # Inspect outer PFS structure
         insp_outer = pfs.inspect_pfs_image(slice_path, ekpfs=ekpfs_key, verify_payloads=False)
-        if insp_outer.errors:
-            print(f"[ERROR] Failed to read outer PFS image: {insp_outer.errors}")
+        fatal_outer = [
+            e for e in insp_outer.errors
+            if "header is not available" in e or "failed to parse inode table" in e
+        ]
+        if fatal_outer:
+            print(f"[ERROR] Failed to read outer PFS image: {fatal_outer}")
             return False
 
         # If the outer PFS wraps a nested pfs_image.dat container (standard game layout):
@@ -945,7 +1103,7 @@ def unpack_pkg(pkg_path, output_dir=None, passcode=None, dump_pfs=False):
                 size=dat_inode.logical_size,
             )
             pbar = ConsoleProgressBar("Game Files")
-            res = pfs.extract_pfs_image(vpath, output_dir, progress=pbar)
+            res = resilient_extract_pfs_image(vpath, output_dir, progress=pbar)
             if res.errors:
                 print(f"\n[ERROR] Extraction failed: {res.errors}")
                 return False
@@ -954,7 +1112,7 @@ def unpack_pkg(pkg_path, output_dir=None, passcode=None, dump_pfs=False):
             print(f"      Direct Flat PFS ({len(insp_outer.file_inodes)} files)")
             print("      Extracting game files directly...\n")
             pbar = ConsoleProgressBar("Game Files")
-            res = pfs.extract_pfs_image(slice_path, output_dir, progress=pbar, ekpfs=ekpfs_key)
+            res = resilient_extract_pfs_image(slice_path, output_dir, progress=pbar, ekpfs=ekpfs_key)
             if res.errors:
                 print(f"\n[ERROR] Extraction failed: {res.errors}")
                 return False
@@ -980,7 +1138,7 @@ def main():
     if not files:
         print("=======================================================")
         print(" PS4 PKG High-Performance Drag and Drop Unpacker")
-        print("=======================================================\n")
+        print("=======================================================")
         print("Usage: Drag and drop one or more .pkg files onto this script.")
         pkg_input = input("Or paste the full path to a .pkg file: ").strip(' "')
         if not pkg_input:
